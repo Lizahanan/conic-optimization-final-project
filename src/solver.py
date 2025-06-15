@@ -1,0 +1,222 @@
+from typing import Sequence, Callable
+
+import numpy as np
+from tqdm import tqdm
+
+from src.function import Function, Linear, LogBarrierFunction
+from src.utils import parse_affine_vars
+
+
+class Newton:
+    def __init__(self, obj_tol = 1e-8, param_tol = 1e-12, wolfe_const = 0.01, backtracking_const = 0.5, ineq_constraints: list[Function]=None, A=None, b=None):
+        self.f = None
+        self.obj_tol = obj_tol
+        self.param_tol = param_tol
+        self.wolfe_const = wolfe_const
+        self.backtracking_const = backtracking_const
+        self.history = None
+        self.success = False
+        self.is_valid = True
+        self.ineq_constraints = ineq_constraints
+        self.A, self.b, _, _ = parse_affine_vars(A, b)
+        self.lhs = None
+        self.rhs = None
+
+        if self.A is not None and self.b is not None:
+            m, n = self.A.shape
+            self.lhs = np.block([[np.zeros((n, n)), self.A.T],
+                                 [self.A, np.zeros((m, m))]])
+            self.rhs = np.zeros(m+n)
+
+    def backtrack_step_size(self, f: Function, x, p):
+        alpha = 1
+        y, g, _ = f.eval(x)
+        max_iter = 50
+        min_step = 1e-12
+
+        while alpha >= min_step and max_iter > 0:
+            next_x = x + alpha * p
+            y_next, _, _ = f.eval(next_x)
+            if y_next <= y + self.wolfe_const * alpha * g.T @ p and check_feasibility(next_x, self.ineq_constraints, self.A, self.b):
+                break
+            alpha *= self.backtracking_const
+            max_iter -= 1
+
+        return alpha
+
+    def next_direction(self, g, h):
+        if np.allclose(h, 0):
+            return None
+
+        if self.lhs is None:
+            try:
+                return np.linalg.solve(h, -g)
+            except np.linalg.LinAlgError:
+                return np.linalg.lstsq(h, -g, rcond=None)[0]
+
+
+        m, n = self.A.shape
+        self.lhs[:n, :n] = h
+        self.rhs[:n] = -g
+        sol = solve_linear_system(self.lhs, self.rhs)
+
+        return sol[:n]
+
+    def should_terminate(self, h, p):
+        return 0.5 * p.T @ h @ p < self.obj_tol
+
+
+class InteriorPointSolver:
+    def __init__(self, mu=10, epsilon=1e-10):
+        self.mu = mu
+        self.epsilon = epsilon
+
+    def solve(self, func: Function, x0: int | Sequence | np.ndarray = None, ineq_constraints: list[Function] = None,
+              eq_constraints_mat=None, eq_constraints_rhs=None, custom_break: Callable = None, mu = None, verbose=True):
+        if verbose:
+            print("Interior point solver started")
+            print("+++++++++++++++++++++++++++++")
+
+        t = 1
+        m = len(ineq_constraints) if ineq_constraints else 0
+        f = LogBarrierFunction(func, ineq_constraints)
+        A, b, _, _ = parse_affine_vars(eq_constraints_mat, eq_constraints_rhs)
+        newton = Newton(ineq_constraints=ineq_constraints, A=A, b=b)
+        mu = mu if mu else self.mu
+
+        if x0 is None:
+            x = self.find_initial_point(func.dim, ineq_constraints, A, b)
+        else:
+            x = np.asarray(x0).ravel()
+
+        i = 1
+        history = []
+        if verbose:
+            print()
+
+        while i == 1 or m / t >= self.epsilon:
+            f.set_t(t)
+            y, _, _ = func.eval(x)
+            history.append(np.append(x, y))
+            if verbose:
+                print(f"[Outer {i:>2}]: y: {y:.4f}, t: {t:d}")
+
+            if not check_feasibility(x, ineq_constraints, A, b):
+                print(f"Error: feasibility check failed.")
+                break
+
+            result = self.solve_inner(f, x, newton, i, verbose=verbose)
+            x_new = result['x']
+
+            if np.linalg.norm(x_new - x) < 1e-12 or (custom_break is not None and custom_break(x)):
+                break
+
+            x = x_new
+            t *= mu
+            i += 1
+
+        y, _, _ = func.eval(x)
+        history.append(np.append(x, y))
+        if verbose:
+            print(f"Done! y: {y:.4f}")
+            print("+++++++++++++++++++++++++++++")
+
+        return {
+            'x': x,
+            'y': y,
+            'iterations': i,
+            'history': history
+        }
+
+    @staticmethod
+    def solve_inner(f, x0, newton, outer_iter, verbose):
+        """Newton solver for inner iterations"""
+        x = x0.copy()
+        max_inner_iter = 100
+
+        for i in tqdm(range(max_inner_iter), desc=f"[Inner {outer_iter:>2}]", disable=(not verbose)):
+            y, g, h = f.eval(x)
+
+            if np.linalg.norm(g) < 1e-8:
+                break
+
+            p = newton.next_direction(g, h)
+            if p is None:
+                print(f"  [Inner {i}] Failed to find next newton step, stopping")
+                break
+
+            alpha = newton.backtrack_step_size(f, x, p)
+            if alpha < 1e-16:
+                print(f"  [Inner {i}] Line search failed, stopping")
+                break
+
+            x_new = x + alpha * p
+
+            if np.linalg.norm(x_new - x) < 1e-12 or newton.should_terminate(h, p):
+                x = x_new
+                break
+
+            x = x_new
+
+        return {'x': x}
+
+    def find_initial_point(self, length, ineq_constraints, A, b):
+        print("\nFinding initial point")
+
+        if A is None:
+            x0 = np.random.rand(length)
+        else:
+            x0 = np.linalg.lstsq(A, b, rcond=None)[0]
+            if x0.size < length:
+                pad_value = 0.1
+                x0 = np.pad(x0, (0, length - x0.size), constant_values=pad_value)
+
+        if not ineq_constraints or check_feasibility(x0, ineq_constraints, A, b):
+            print("Initial point found")
+            return x0
+
+        print("Finding feasible initial point using phase-1 method...")
+
+        constraint_values = np.array([ineq.eval(x0)[0] for ineq in ineq_constraints])
+        max_violation = max(0, max(constraint_values))
+        x0_extended = np.append(x0, max_violation + 1.0)
+        s = np.zeros(length + 1)
+        s[-1] = 1
+        f = Linear(s)
+        ineq_constraints_with_s = [constraint.pad((0, 1)) - f for constraint in ineq_constraints]
+        A_extended = np.pad(A, ((0, 0), (0, 1)), 'constant') if A is not None else None
+        custom_break = lambda x: x[-1] < 0 or check_feasibility(x[:-1], ineq_constraints, A, b)
+
+        result = self.solve(func=f, x0=x0_extended,
+                            ineq_constraints=ineq_constraints_with_s,
+                            eq_constraints_mat=A_extended,
+                            eq_constraints_rhs=b,
+                            custom_break=custom_break,
+                            mu = 10,
+                            verbose=True)
+
+        s_val = result['x'][-1]
+
+        if s_val >= 0:
+            raise ValueError(f"The problem is infeasible (gap = {s_val})")
+
+        print("Initial point found")
+
+        return result['x'][:-1]
+
+
+def check_feasibility(x, ineq_constraints, A, b):
+    if A is not None and not np.isclose(A @ x, b):
+        return False
+
+    if ineq_constraints:
+        constraint_values = np.array([ineq.eval(x)[0] for ineq in ineq_constraints])
+        return all(constraint_values < 0)
+
+    return True
+
+def solve_linear_system(lhs, rhs):
+    try:
+        return np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(lhs, rhs, rcond=None)[0]
